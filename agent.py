@@ -18,6 +18,8 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
 
 
@@ -37,11 +39,53 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "query": query,              # original user query
         "parsed": {},                # extracted description / size / max_price
         "search_results": [],        # list of matching listing dicts
+        "retry_attempted": False,    # True after the first broadened retry
+        "retry_note": None,          # human-readable note about what filter was dropped
+        "wardrobe_empty": False,     # True when user submitted no wardrobe items
         "selected_item": None,       # top result, passed into suggest_outfit
         "wardrobe": wardrobe,        # user's wardrobe dict
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+    }
+
+
+# ── query parser ──────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract description, size, and max_price from a lowercased natural language query.
+    Uses regex — no LLM call needed for this structured extraction.
+    """
+    query = query.lower()
+
+    # max_price: "under $30", "under 30", "$30", "below $40", "less than $25"
+    price_m = re.search(
+        r'(?:under|below|max(?:imum)?|less\s+than)\s*\$?(\d+(?:\.\d+)?)', query
+    )
+    if not price_m:
+        price_m = re.search(r'\$(\d+(?:\.\d+)?)', query)
+    max_price = float(price_m.group(1)) if price_m else None
+
+    # size: "size M", "in size XL", "size s/m"
+    size_m = re.search(r'\b(?:in\s+)?size\s+([a-z0-9]+(?:/[a-z0-9]+)?)\b', query)
+    size = size_m.group(1).upper() if size_m else None
+
+    # description: strip price, size, and common opener phrases
+    desc = query
+    for pattern in [
+        r'(?:under|below|max(?:imum)?|less\s+than)\s*\$?\d+(?:\.\d+)?',
+        r'\$\d+(?:\.\d+)?',
+        r'\b(?:in\s+)?size\s+[a-z0-9]+(?:/[a-z0-9]+)?\b',
+        r"^(?:i'?m\s+)?(?:looking for|searching for|find me|i want|show me|need)\s+(?:an?\s+)?",
+    ]:
+        desc = re.sub(pattern, ' ', desc)
+    desc = re.sub(r'\s+', ' ', desc).strip(' ,.')
+
+    return {
+        "description": desc if desc else query,
+        "size": size,
+        "max_price": max_price,
     }
 
 
@@ -92,9 +136,55 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: initialize session
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: parse query into description / size / max_price
+    parsed = _parse_query(query)
+    session["parsed"] = parsed
+    description = parsed["description"]
+    size        = parsed["size"]
+    max_price   = parsed["max_price"]
+
+    # Step 3: first search attempt
+    results = search_listings(description, size=size, max_price=max_price)
+
+    # Retry once with loosened constraints (planning.md error-handling spec)
+    if not results:
+        session["retry_attempted"] = True
+        if size is not None:
+            results = search_listings(description, size=None, max_price=max_price)
+            session["retry_note"] = f"No results for size '{size}' — automatically retried without size filter."
+        elif max_price is not None:
+            results = search_listings(description, size=None, max_price=None)
+            session["retry_note"] = f"No results under ${max_price:.0f} — automatically retried without price limit."
+
+    session["search_results"] = results
+
+    if not results:
+        session["error"] = (
+            f"No listings found for '{description}'"
+            + (f", size {size}" if size else "")
+            + (f", under ${max_price:.0f}" if max_price else "")
+            + ". Try different keywords, a wider size, or a higher budget."
+        )
+        return session
+
+    # Step 4: select top result
+    session["selected_item"] = results[0]
+
+    # Step 5: suggest outfit
+    session["wardrobe_empty"] = not bool(wardrobe.get("items") or [])
+    session["outfit_suggestion"] = suggest_outfit(
+        session["selected_item"], wardrobe
+    )
+
+    # Step 6: create fit card (passes clean outfit string — nudge added by app.py)
+    session["fit_card"] = create_fit_card(
+        session["outfit_suggestion"], session["selected_item"]
+    )
+
+    # Step 7: return completed session
     return session
 
 

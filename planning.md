@@ -17,7 +17,7 @@ You must have at least 3 tools. The three required tools are listed — add any 
 
 **What it does:**
 <!-- Describe what this tool does in 1–2 sentences -->
-Search the data in listings and return the results. Can handle missing inputs like no size or max_price. Will retry with loosend constrains once if no results.
+Search the data in listings and return the results. Can handle missing inputs like no size or max_price. Returns an empty list if nothing matches — the planning loop owns the retry logic.
 **Input parameters:**
 <!-- List each parameter, its type, and what it represents -->
 - `description` (str): user style description or search keywords
@@ -32,12 +32,7 @@ id, title, price, size, category, style_tags, colors, brand, platform, descripti
 
 **What happens if it fails or returns nothing:**
 <!-- What should the agent do if no listings match? -->
-If there are some errors, the agent will show the error to the user and ask the user to change the input to try again. 
-If the first search returns no results:
-   - Automatically retry once with loosened constraints.
-   - The retry should broaden filters by dropping or widening `size`, relaxing `max_price`, or loosening keywords.
-If retry still returns no results:
-   - Ask the user for more item details.
+The tool always returns a list and never raises an exception. If nothing matches, it returns `[]`. The planning loop in `run_agent` detects the empty list and retries once with loosened constraints (drops `size` first, then `max_price`). If the retry also returns `[]`, the agent sets `session["error"]` and stops before calling `suggest_outfit`.
 ---
 
 ### Tool 2: suggest_outfit
@@ -52,14 +47,10 @@ Generate outfit suggestions by pairing the selected listing with one or more pie
 
 **What it returns:**
 <!-- Describe the return value -->
-A dict containing:
-new_item: the first item search_listings returned
-selected_items: list[dict] of wardrobe pieces used in the outfit
-styling_notes: str explanation of why the pieces work together
-outfit_type: str label such as casual, grunge, or streetwear
+A string containing 1–2 complete outfit suggestions, naming specific wardrobe pieces and explaining why each combination works. If the wardrobe is empty, returns general styling advice instead.
 **What happens if it fails or returns nothing:**
 <!-- What should the agent do if the wardrobe is empty or no outfit can be suggested? -->
-If the wardrobe is empty or no outfit can be suggested,  it returns an empty suggestion and the agent asks the user for more wardrobe details or offers to use the example wardrobe.
+If the wardrobe is empty or no outfit can be suggested,  it returns a common suggestion and the agent asks the user for more wardrobe details or offers to use the example wardrobe.
 ---
 
 ### Tool 3: create_fit_card
@@ -69,7 +60,7 @@ If the wardrobe is empty or no outfit can be suggested,  it returns an empty sug
 Create a short, shareable fit description of the completed outfit. Mentions the new item, styling details, and why the look works.
 **Input parameters:**
 <!-- List each parameter, its type, and what it represents -->
-- `outfit` (dict): suggestion returned by suggest_outfit
+- `outfit` (str): suggestion string returned by suggest_outfit
 - `new_item` (dict): the first item search_listings returned
 
 **What it returns:**
@@ -104,12 +95,9 @@ The agent then tells the user it cannot create a fit card yet and asks whether t
    - Select the top match as `top_match`.
    - Store `search_results` and `selected_item` in session state.
 6. Call `suggest_outfit(new_item=top_match, wardrobe=user_wardrobe)`.
-7. If `suggest_outfit` fails or returns no valid outfit:
-   - Ask the user to add more wardrobe details or offer the example wardrobe.
-   - Retry `suggest_outfit` once the wardrobe improves.
-8. If outfit suggestion succeeds:
-   - Call `create_fit_card(outfit=suggested_outfit, new_item=top_match)`.
-9. Return the final fit description of a complete outfitto the user.
+7. If the wardrobe was empty, `suggest_outfit` returns general styling advice. The agent appends a note to `outfit_suggestion` telling the user to switch to "Example wardrobe" for personalised combinations. (Gradio is single-request, so the nudge is embedded in the output rather than an interactive re-prompt.)
+8. Call `create_fit_card(outfit=outfit_suggestion, new_item=top_match)`. If `outfit_suggestion` is empty or missing, `create_fit_card` returns an error string — surfaced in the fit card panel without crashing.
+9. Return the completed session to the user.
 
 ---
 
@@ -119,19 +107,21 @@ The agent then tells the user it cannot create a fit card yet and asks whether t
 <!-- Describe how your agent stores and accesses state within a session. What data is tracked? How is it passed between tool calls? -->
 The agent maintains a session state object with the following fields:
 - `query`: the original user request
-- `search_description`, `search_size`, `search_max_price`: parsed search parameters
+- `parsed`: dict containing `description`, `size`, and `max_price` extracted from the query
 - `search_results`: list returned by `search_listings`
 - `retry_attempted`: boolean flag tracking whether the first search was already retried
+- `retry_note`: human-readable message explaining which filter was dropped on retry (e.g. "No results for size 'XXXL' — automatically retried without size filter"), or `None` if no retry occurred
 - `selected_item`: the top match chosen from `search_results`
 - `wardrobe`: the user's wardrobe object (either user-provided or example)
-- `suggested_outfit`: result from `suggest_outfit`
-- `fit_card`: final output from `create_fit_card`
+- `outfit_suggestion`: string result from `suggest_outfit`
+- `fit_card`: string result from `create_fit_card`
+- `error`: set to a message string if the interaction ended early, otherwise `None`
 
 **Data flow between tools:**
 - `search_listings` returns a list; the agent selects the top item and stores it as `selected_item`.
 - `selected_item` is passed as `new_item` to `suggest_outfit` along with the `wardrobe` object.
-- `suggested_outfit` is passed to `create_fit_card` along with `selected_item` (the `new_item`).
-- If `search_listings` fails after retry, the session state marks `retry_attempted=True` and `search_results=[]`, and the agent asks the user for a revised query before continuing.
+- `outfit_suggestion` is passed to `create_fit_card` along with `selected_item` (the `new_item`).
+- If `search_listings` returns `[]` after retry, the agent sets `session["error"]` and returns early without calling `suggest_outfit`.
 
 ---
 
@@ -182,40 +172,40 @@ search_listings(description, size, max_price)
          ▼
     suggest_outfit(new_item=selected_item, wardrobe=user_wardrobe)
          │
-         ├─ outfit = {} (empty wardrobe or no match)
+         ├─ wardrobe empty → returns general styling advice
          │    │
-         │    └─► [ERROR] Ask user for more wardrobe details ─────┐
-         │         │                                              │
-         │         └─ [RETRY] suggest_outfit with new wardrobe ◄─┘
+         │    └─► agent appends nudge to outfit_suggestion:
+         │         "Switch to Example wardrobe for named-piece combos"
          │
-         └─ outfit = {selected_items, styling_notes, outfit_type}
+         └─ outfit = str (styling suggestion with named wardrobe pieces)
               │
-              ├─ Session: suggested_outfit = outfit
+              ├─ Session: outfit_suggestion = outfit
               │
               ▼
-         create_fit_card(outfit=suggested_outfit, new_item=selected_item)
+         create_fit_card(outfit=outfit_suggestion, new_item=selected_item)
               │
-              ├─ fit_card = {} (incomplete input)
+              ├─ outfit empty/None → returns error string
               │    │
-              │    └─► [ERROR] Tell user outfit is incomplete ──────┐
-              │         (ask to retry search or add wardrobe)       │
-              │                                                     │
-              └─ fit_card = {summary}
+              │    └─► error shown in fit card panel
+              │         (user prompted to retry or add wardrobe details)
+              │
+              └─ fit_card = str (OOTD caption)
                    │
                    ├─ Session: fit_card = fit_card
                    │
                    ▼
               ┌──────────────────────────┐
               │  Return to User:         │
-              │  - fit_card[summary]     │
               │  - selected_item details │
+              │  - outfit_suggestion     │
+              │  - fit_card              │
               └──────────────────────────┘
 
 ════════════════════════════════════════════════════════════════════════════
                           SESSION STATE (persistent across tools)
-                          - query, search_results, retry_attempted
-                          - selected_item, wardrobe, suggested_outfit
-                          - fit_card
+                          - query, parsed, search_results, retry_attempted
+                          - selected_item, wardrobe, outfit_suggestion
+                          - fit_card, error
 ════════════════════════════════════════════════════════════════════════════
 ```
 
@@ -235,10 +225,10 @@ search_listings(description, size, max_price)
      before trusting it" is a plan. -->
 
 **Milestone 3 — Individual tool implementations:**
-I'll use the Claude and gives the tools spec in planning, ask it to implement all three methods. I will also give tools in data_loader and ask it complete tools one by one. I will check and test it until complete all three tools.
+I 'll give Claude the Tool 1 spec (inputs, return value, failure mode) from planning.md plus `load_listings()` from data_loader.py, and asked it to implement `search_listings` in tools.py. I verify it by running three test queries (matching results, no results, price-filtered) and checked that empty inputs returned `[]` without crashing. I repeated this process for Tool 2 using the Tool 2 spec and wardrobe_schema.json, and for Tool 3 using the Tool 3 spec and running `create_fit_card("", item)` and `create_fit_card(None, item)` to confirm the guard worked before accepting the output.
 
 **Milestone 4 — Planning loop and state management:**
-I'll ask the Claude to and gives the planning loop and state management specs in planning, ask it to complete it. I will ask it to complete step by step based on the planning loop and test each step until it complete it.
+I'll give Claude the Planning Loop and State Management sections of planning.md and asked it to implement `run_agent` step by step. I verify it by running the CLI test in agent.py against both the happy path ("vintage graphic tee under $30") and the no-results path ("designer ballgown size XXS under $5"), confirming that `session["fit_card"]` was `None` and `suggest_outfit` was never called on the error path (verified with a mock spy).
 
 ---
 

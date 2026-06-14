@@ -43,8 +43,54 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            string and return it along with session["outfit_suggestion"] and
            session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    # Step 1: guard against empty query and normalize case
+    if not user_query or not user_query.strip():
+        return "Please enter a search query.", "", ""
+    user_query = user_query.lower().strip()
+
+    # Step 2: select wardrobe
+    wardrobe = (
+        get_example_wardrobe()
+        if wardrobe_choice == "Example wardrobe"
+        else get_empty_wardrobe()
+    )
+
+    # Step 3: run the agent
+    session = run_agent(user_query, wardrobe)
+
+    # Step 4: surface errors — show guidance in the outfit panel too
+    if session["error"]:
+        guidance = (
+            "Nothing found this time. Try:\n"
+            "• Broader keywords (e.g. 'jacket' instead of 'vintage leather jacket')\n"
+            "• Removing or raising your price limit\n"
+            "• Leaving size blank to search all sizes\n"
+            "• Different style words (e.g. 'grunge', 'y2k', 'streetwear')"
+        )
+        return session["error"], guidance, ""
+
+    # Step 5: format the top listing
+    item = session["selected_item"]
+    listing_text = (
+        f"{item['title']}\n"
+        f"Price: ${item['price']:.2f}  |  Size: {item['size']}  |  Platform: {item['platform']}\n"
+        f"Condition: {item['condition']}\n\n"
+        f"{item['description']}"
+    )
+    if session.get("retry_note"):
+        listing_text = f"⚠️ {session['retry_note']}\n\n{listing_text}"
+
+    # Step 6: add wardrobe nudge at the top of the outfit panel if wardrobe was empty
+    outfit_text = session["outfit_suggestion"]
+    if session.get("wardrobe_empty"):
+        outfit_text = (
+            "💡 Your wardrobe is empty — these are general styling ideas.\n"
+            "Switch to 'Example wardrobe' above for outfit combos with specific named pieces.\n"
+            "────────────────────────────────\n"
+            + outfit_text
+        )
+
+    return listing_text, outfit_text, session["fit_card"]
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
