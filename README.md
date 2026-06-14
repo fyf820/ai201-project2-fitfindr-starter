@@ -206,7 +206,7 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 *Example from testing:* `create_fit_card("", item)` and `create_fit_card(None, item)` both returned `"Error: outfit suggestion is missing or incomplete. Please retry the search or add wardrobe details before generating a fit card."` — no exception in either case.
 
-Triggered failures: see video at botton
+Triggered failures: see video at bottom
 
 ---
 
